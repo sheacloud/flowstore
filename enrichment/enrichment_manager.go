@@ -2,44 +2,29 @@ package enrichment
 
 import (
 	"fmt"
-	"net"
 
-	"github.com/vmware/go-ipfix/pkg/entities"
+	"github.com/sheacloud/flowstore"
 )
 
 type Enricher interface {
-	Enrich(flow *EnrichedFlow)
-}
-
-type EnrichedFlow struct {
-	Fields map[string]interface{}
-}
-
-func (ef *EnrichedFlow) GetSourceIP() net.IP {
-	return ef.Fields["sourceIPv4Address"].(net.IP)
-}
-
-func (ef *EnrichedFlow) GetDestIP() net.IP {
-	return ef.Fields["destinationIPv4Address"].(net.IP)
-}
-
-func (ef *EnrichedFlow) GetStartTime() uint64 {
-	return ef.Fields["flowStartMilliseconds"].(uint64)
+	Enrich(flow *flowstore.Flow)
 }
 
 type EnrichmentManager struct {
-	InputChannel  chan *entities.Message
-	OutputChannel chan *EnrichedFlow
+	InputChannel  chan *flowstore.Flow
+	OutputChannel chan *flowstore.Flow
 	StopChannel   chan bool
+	Stopped       chan bool
 	Enrichers     []Enricher
 }
 
-func NewEnrichmentManager(input chan *entities.Message, output chan *EnrichedFlow, enrichers []Enricher) EnrichmentManager {
+func NewEnrichmentManager(input chan *flowstore.Flow, output chan *flowstore.Flow, enrichers []Enricher) EnrichmentManager {
 	return EnrichmentManager{
 		InputChannel:  input,
 		OutputChannel: output,
 		StopChannel:   make(chan bool),
 		Enrichers:     enrichers,
+		Stopped:       make(chan bool),
 	}
 }
 
@@ -51,32 +36,19 @@ func (em *EnrichmentManager) Start() {
 			case <-em.StopChannel:
 				break InfiniteLoop
 			case msg := <-em.InputChannel:
-				set := msg.GetSet()
-				if set.GetSetType() == entities.Template {
-					fmt.Println("Skipping template set")
-					continue
-				} else {
-					for _, record := range set.GetRecords() {
-						enrichedFlow := EnrichedFlow{
-							Fields: make(map[string]interface{}),
-						}
-						for _, ie := range record.GetOrderedElementList() {
-							enrichedFlow.Fields[ie.Element.Name] = ie.Value
-						}
-
-						for _, enricher := range em.Enrichers {
-							enricher.Enrich(&enrichedFlow)
-						}
-
-						em.OutputChannel <- &enrichedFlow
-					}
+				for _, enricher := range em.Enrichers {
+					enricher.Enrich(msg)
 				}
+
+				em.OutputChannel <- msg
 			}
 		}
 		fmt.Println("Enrichment Manager stopped")
+		em.Stopped <- true
 	}()
 }
 
 func (em *EnrichmentManager) Stop() {
 	em.StopChannel <- true
+	<-em.Stopped
 }

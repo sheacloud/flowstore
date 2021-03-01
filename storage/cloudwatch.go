@@ -10,7 +10,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/google/uuid"
-	"github.com/sheacloud/flowstore/enrichment"
+	"github.com/sheacloud/flowstore"
 )
 
 type CloudwatchState struct {
@@ -52,9 +52,9 @@ type LogStream struct {
 	cloudwatchState     *CloudwatchState
 }
 
-func (l *LogStream) IngestEvent(flow *enrichment.EnrichedFlow) {
+func (l *LogStream) IngestEvent(flow *flowstore.Flow) {
 	data, _ := json.MarshalIndent(flow, "", "  ")
-	l.addEventToBuffer(data, int64(flow.GetStartTime()))
+	l.addEventToBuffer(data, int64(flow.FlowStartMilliseconds))
 }
 
 func (l *LogStream) addEventToBuffer(message []byte, timestamp int64) {
@@ -121,6 +121,6 @@ func (l *LogStream) UploadBufferedEvents() {
 	l.uploadLock.Unlock()
 }
 
-func (c *CloudwatchState) Store(flow *enrichment.EnrichedFlow) {
+func (c *CloudwatchState) Store(flow *flowstore.Flow) {
 	c.LogStream.IngestEvent(flow)
 }

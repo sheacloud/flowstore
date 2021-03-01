@@ -3,24 +3,26 @@ package storage
 import (
 	"fmt"
 
-	"github.com/sheacloud/flowstore/enrichment"
+	"github.com/sheacloud/flowstore"
 )
 
 type StorageBackend interface {
-	Store(flow *enrichment.EnrichedFlow)
+	Store(flow *flowstore.Flow)
 }
 
 type StorageManager struct {
-	InputChannel    chan *enrichment.EnrichedFlow
+	InputChannel    chan *flowstore.Flow
 	StopChannel     chan bool
 	StorageBackends []StorageBackend
+	Stopped         chan bool
 }
 
-func NewStorageManager(input chan *enrichment.EnrichedFlow, backends []StorageBackend) StorageManager {
+func NewStorageManager(input chan *flowstore.Flow, backends []StorageBackend) StorageManager {
 	return StorageManager{
 		InputChannel:    input,
 		StopChannel:     make(chan bool),
 		StorageBackends: backends,
+		Stopped:         make(chan bool),
 	}
 }
 
@@ -37,10 +39,12 @@ func (sm *StorageManager) Start() {
 				}
 			}
 		}
-		fmt.Println("Enrichment Manager stopped")
+		fmt.Println("Storage Manager stopped")
+		sm.Stopped <- true
 	}()
 }
 
 func (sm *StorageManager) Stop() {
 	sm.StopChannel <- true
+	<-sm.Stopped
 }

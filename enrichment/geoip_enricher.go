@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	geoip2 "github.com/oschwald/geoip2-golang"
+	"github.com/sheacloud/flowstore"
 )
 
 type GeoIPMetadata struct {
@@ -80,10 +81,10 @@ func (e *GeoIPEnricher) FlattenCity(city *geoip2.City) GeoIPMetadata {
 	return metadata
 }
 
-func (e *GeoIPEnricher) Enrich(flow *EnrichedFlow) {
-	srcCityData, _ := e.db.City(flow.GetSourceIP())
-	dstCityData, _ := e.db.City(flow.GetDestIP())
+func (e *GeoIPEnricher) Enrich(flow *flowstore.Flow) {
+	srcCityData, _ := e.db.City(flow.SourceIP)
+	dstCityData, _ := e.db.City(flow.DestinationIP)
 
-	flow.Fields["SourceGeoData"] = e.FlattenCity(srcCityData)
-	flow.Fields["DestGeoData"] = e.FlattenCity(dstCityData)
+	flow.Metadata["SourceGeoData"] = e.FlattenCity(srcCityData)
+	flow.Metadata["DestGeoData"] = e.FlattenCity(dstCityData)
 }
