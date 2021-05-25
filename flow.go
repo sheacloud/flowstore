@@ -1,6 +1,9 @@
 package flowstore
 
-import "net"
+import (
+	"fmt"
+	"net"
+)
 
 // Flow represents a netflow with associated metadata
 type Flow struct {
@@ -16,4 +19,8 @@ type Flow struct {
 	ReverseFlowOctetCount  uint64
 	ReverseFlowPacketCount uint64
 	Metadata               map[string]interface{}
+}
+
+func (f *Flow) String() string {
+	return fmt.Sprintf("%s:%v --%v--> %s:%v", f.SourceIP.String(), f.SourcePort, f.Protocol, f.DestinationIP.String(), f.DestinationPort)
 }

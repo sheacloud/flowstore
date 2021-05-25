@@ -88,3 +88,7 @@ func (e *GeoIPEnricher) Enrich(flow *flowstore.Flow) {
 	flow.Metadata["SourceGeoData"] = e.FlattenCity(srcCityData)
 	flow.Metadata["DestGeoData"] = e.FlattenCity(dstCityData)
 }
+
+func (e *GeoIPEnricher) GetName() string {
+	return "GeoIPEnricher"
+}

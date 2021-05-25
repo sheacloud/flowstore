@@ -15,28 +15,33 @@
 package main
 
 import (
+	"context"
+	"flag"
 	"fmt"
-	"log"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	flag "github.com/spf13/pflag"
+	"github.com/spf13/viper"
 	"k8s.io/klog/v2"
 
 	"github.com/vmware/go-ipfix/pkg/registry"
 
 	"github.com/sheacloud/flowstore"
-	"github.com/sheacloud/flowstore/collection"
+	"github.com/sheacloud/flowstore/collection/httpapi"
+	"github.com/sheacloud/flowstore/collection/ipfix"
 	"github.com/sheacloud/flowstore/enrichment"
 	"github.com/sheacloud/flowstore/storage"
-
-	goflag "flag"
 
 	_ "net/http/pprof"
 )
@@ -46,10 +51,15 @@ const (
 )
 
 var (
-	IPFIXAddr      string
-	IPFIXPort      uint16
-	IPFIXTransport string
-	ipfixCollector *collection.IpfixCollector
+	cloudwatchViper = viper.New()
+	s3Viper         = viper.New()
+	ipfixViper      = viper.New()
+	apiViper        = viper.New()
+	prometheusViper = viper.New()
+	logViper        = viper.New()
+
+	logLevel  string
+	logCaller bool
 
 	rootCmd = &cobra.Command{
 		Use:  "flowstore",
@@ -60,23 +70,145 @@ var (
 	}
 )
 
-func init() {
-	addIPFIXFlags(rootCmd.Flags())
+func initCloudwatchOptions() {
+
+	cloudwatchViper.SetEnvPrefix("cloudwatch")
+	cloudwatchViper.AutomaticEnv()
+
+	cloudwatchViper.BindEnv("log_group_name")
+	cloudwatchViper.SetDefault("log_group_name", "/goflow/")
+
+	cloudwatchViper.BindEnv("max_buffer_entries")
+	cloudwatchViper.SetDefault("max_buffer_entries", 1000)
+
+	cloudwatchViper.BindEnv("max_buffer_size")
+	cloudwatchViper.SetDefault("max_buffer_size", 500000)
+
+	cloudwatchViper.BindEnv("buffer_time_limit")
+	cloudwatchViper.SetDefault("buffer_time_limit", 10)
+}
+
+func initS3Options() {
+	s3Viper.SetEnvPrefix("s3")
+	s3Viper.AutomaticEnv()
+
+	s3Viper.BindEnv("bucket_name")
+	s3Viper.SetDefault("bucket_name", "sheacloud-goflow")
+
+	s3Viper.BindEnv("max_object_size")
+	s3Viper.SetDefault("max_object_size", 10000)
+}
+
+func initIpfixOptions() {
+	ipfixViper.SetEnvPrefix("ipfix")
+	ipfixViper.AutomaticEnv()
+
+	ipfixViper.BindEnv("enable")
+	ipfixViper.SetDefault("enable", true)
+
+	ipfixViper.BindEnv("addr")
+	ipfixViper.SetDefault("addr", "0.0.0.0")
+
+	ipfixViper.BindEnv("port")
+	ipfixViper.SetDefault("port", 4739)
+
+	ipfixViper.BindEnv("protocol")
+	ipfixViper.SetDefault("protocol", "tcp")
+}
+
+func initApiOptions() {
+	apiViper.SetEnvPrefix("API")
+	apiViper.AutomaticEnv()
+
+	apiViper.BindEnv("enable")
+	apiViper.SetDefault("enable", true)
+
+	apiViper.BindEnv("addr")
+	apiViper.SetDefault("addr", "0.0.0.0")
+
+	apiViper.BindEnv("port")
+	apiViper.SetDefault("port", 8080)
+}
+
+func initPrometheusOptions() {
+	prometheusViper.SetEnvPrefix("prometheus")
+	prometheusViper.AutomaticEnv()
+
+	prometheusViper.BindEnv("addr")
+	prometheusViper.SetDefault("addr", "0.0.0.0")
+
+	prometheusViper.BindEnv("port")
+	prometheusViper.SetDefault("port", "9090")
+
+	prometheusViper.BindEnv("path")
+	prometheusViper.SetDefault("path", "/metrics")
+}
+
+func initLogOptions() {
+	logViper.SetEnvPrefix("log")
+	logViper.AutomaticEnv()
+
+	logViper.BindEnv("level")
+	logViper.SetDefault("level", "info")
+
+	logViper.BindEnv("caller")
+	logViper.SetDefault("caller", false)
+}
+
+func initLogging() {
+	// disable klog logging to mute underlying go-ipfix library
 	klog.InitFlags(nil)
-	goflag.Parse()
-	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
+	flag.Set("logtostderr", "false")
+	flag.Set("alsologtostderr", "false")
+	klog.SetOutput(ioutil.Discard)
+
+	logrus.SetReportCaller(logViper.GetBool("caller"))
+	logrus.SetOutput(os.Stdout)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
+	switch strings.ToLower(logViper.GetString("level")) {
+	case "panic":
+		logrus.SetLevel(logrus.PanicLevel)
+	case "fatal":
+		logrus.SetLevel(logrus.FatalLevel)
+	case "error":
+		logrus.SetLevel(logrus.ErrorLevel)
+	case "warning":
+		logrus.SetLevel(logrus.WarnLevel)
+	case "info":
+		logrus.SetLevel(logrus.InfoLevel)
+	case "debug":
+		logrus.SetLevel(logrus.DebugLevel)
+	case "trace":
+		logrus.SetLevel(logrus.TraceLevel)
+	default:
+		fmt.Printf("Invalid log level %s - valid options are trace, debug, info, warning, error, fatal, panic\n", logLevel)
+		os.Exit(1)
+	}
 }
 
-func httpServer() {
-	fmt.Println("starting prom server")
-	http.Handle("/metrics", promhttp.Handler())
-	log.Fatal(http.ListenAndServe(":9090", nil))
+func init() {
+	initCloudwatchOptions()
+	initS3Options()
+	initIpfixOptions()
+	initApiOptions()
+	initPrometheusOptions()
+	initLogOptions()
+
+	initLogging()
 }
 
-func addIPFIXFlags(fs *flag.FlagSet) {
-	fs.StringVar(&IPFIXAddr, "ipfix.addr", "0.0.0.0", "IPFIX collector address")
-	fs.Uint16Var(&IPFIXPort, "ipfix.port", 4739, "IPFIX collector port")
-	fs.StringVar(&IPFIXTransport, "ipfix.transport", "tcp", "IPFIX collector transport layer")
+func prometheusServer() {
+	logrus.WithFields(logrus.Fields{
+		"addr": prometheusViper.GetString("addr"),
+		"port": prometheusViper.GetString("port"),
+		"path": prometheusViper.GetString("path"),
+	}).Info("Starting Prometheus...")
+
+	http.Handle(prometheusViper.GetString("path"), promhttp.Handler())
+	logrus.Fatal(http.ListenAndServe(fmt.Sprintf(":%v", prometheusViper.GetString("port")), nil))
 }
 
 func signalHandler(stopCh chan struct{}) {
@@ -93,22 +225,35 @@ func signalHandler(stopCh chan struct{}) {
 }
 
 func run() error {
-	klog.Info("Starting IPFIX collector")
-
 	// Load the IPFIX global registry
 	registry.LoadRegistry()
 
-	ipfixOutput := make(chan *flowstore.Flow)
-	ipfixCollector = collection.NewIpfixCollector(IPFIXAddr, IPFIXPort, IPFIXTransport, ipfixOutput)
-	ipfixCollector.Start()
+	flowChannel := make(chan *flowstore.Flow)
+
+	enableIpfix := ipfixViper.GetBool("enable")
+	enableApi := apiViper.GetBool("enable")
+
+	var ipfixCollector *ipfix.IpfixCollector
+
+	if enableIpfix {
+		ipfixCollector = ipfix.NewIpfixCollector(ipfixViper.GetString("addr"), uint16(ipfixViper.GetUint("port")), ipfixViper.GetString("protocol"), flowChannel)
+		ipfixCollector.Start()
+	}
+
+	if enableApi {
+		httpRouter, _ := httpapi.GetRouter(flowChannel)
+		go func() {
+			httpRouter.Run(fmt.Sprintf("%s:%v", apiViper.GetString("addr"), apiViper.GetUint("port")))
+		}()
+	}
 
 	geo := enrichment.GeoIPEnricher{
 		Language: "en",
 	}
 	geo.Initialize()
 
-	enrichmentOutput := make(chan *flowstore.Flow)
-	enrichmentManager := enrichment.NewEnrichmentManager(ipfixOutput, enrichmentOutput, []enrichment.Enricher{&geo})
+	enrichedFlowChannel := make(chan *flowstore.Flow)
+	enrichmentManager := enrichment.NewEnrichmentManager(flowChannel, enrichedFlowChannel, []enrichment.Enricher{&geo})
 	enrichmentManager.Start()
 
 	sess := session.Must(session.NewSessionWithOptions(session.Options{
@@ -118,44 +263,50 @@ func run() error {
 	cloudwatchLogsSvc := cloudwatchlogs.New(sess)
 
 	cloudwatch := storage.CloudwatchState{
-		LogGroupName:      "/goflow/",
+		LogGroupName:      cloudwatchViper.GetString("log_group_name"),
+		MaxBufferSize:     cloudwatchViper.GetInt("max_buffer_size"),
+		MaxBufferEntries:  cloudwatchViper.GetInt("max_buffer_entries"),
+		BufferTimeLimit:   cloudwatchViper.GetInt("buffer_time_limit"),
 		CloudwatchLogsSvc: cloudwatchLogsSvc,
 	}
 
 	cloudwatch.Initialize()
-	//
-	// timestreamSvc := timestreamwrite.New(sess)
-	// timestream := storage.TimestreamState{
-	// 	DatabaseName:  "flowstore",
-	// 	TableName:     "flows",
-	// 	TimestreamSvc: timestreamSvc,
-	// }
 
-	klogStorage := storage.KlogState{}
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion("us-east-1"))
+	if err != nil {
+		panic(err)
+	}
 
-	// elasticsearchState := storage.NewElasticsearchState("bleh", "flowstore")
+	s3Client := s3.NewFromConfig(cfg)
 
-	storageManager := storage.NewStorageManager(enrichmentOutput, []storage.StorageBackend{&cloudwatch, &klogStorage})
+	s3Storage := storage.S3State{
+		S3Client:      s3Client,
+		BucketName:    s3Viper.GetString("bucket_name"),
+		MaxObjectSize: s3Viper.GetInt("max_object_size"),
+	}
+
+	s3Storage.Initialize()
+
+	storageManager := storage.NewStorageManager(enrichedFlowChannel, []storage.StorageBackend{&cloudwatch, &s3Storage})
 	storageManager.Start()
 
 	stopCh := make(chan struct{})
 	go signalHandler(stopCh)
 
 	<-stopCh
-	klog.Info("Stopping flowstore")
-	ipfixCollector.Stop()
+	logrus.Info("Stopping flowstore")
+	if enableIpfix {
+		ipfixCollector.Stop()
+	}
 	enrichmentManager.Stop()
 	storageManager.Stop()
 	return nil
 }
 
 func main() {
-	defer klog.Flush()
-
-	go httpServer()
+	go prometheusServer()
 
 	if err := rootCmd.Execute(); err != nil {
-		klog.Flush()
 		os.Exit(1)
 	}
 }

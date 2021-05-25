@@ -11,12 +11,16 @@ import (
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/google/uuid"
 	"github.com/sheacloud/flowstore"
+	"github.com/sirupsen/logrus"
 )
 
 type CloudwatchState struct {
 	LogGroupName      string
 	LogStream         *LogStream
 	CloudwatchLogsSvc *cloudwatchlogs.CloudWatchLogs
+	MaxBufferSize     int
+	BufferTimeLimit   int
+	MaxBufferEntries  int
 }
 
 func (c *CloudwatchState) Initialize() {
@@ -27,6 +31,9 @@ func (c *CloudwatchState) Initialize() {
 		LogGroupName:        c.LogGroupName,
 		bufferedEvents:      []*cloudwatchlogs.InputLogEvent{},
 		bufferedEventsBytes: 0,
+		maxBufferSize:       c.MaxBufferSize,
+		maxBufferEntries:    c.MaxBufferEntries,
+		bufferTimeLimit:     c.BufferTimeLimit,
 		cloudwatchState:     c,
 	}
 
@@ -35,7 +42,11 @@ func (c *CloudwatchState) Initialize() {
 		LogStreamName: aws.String(logStreamName),
 	})
 	if err != nil {
-		fmt.Println("error creating log stream")
+		logrus.WithFields(logrus.Fields{
+			"log_group_name":  c.LogGroupName,
+			"log_stream_name": logStreamName,
+			"error":           err,
+		}).Error("Error creating cloudwatch log stream")
 		return
 	}
 }
@@ -47,6 +58,9 @@ type LogStream struct {
 	bufferedEvents      []*cloudwatchlogs.InputLogEvent
 	bufferedEventsBytes int
 	bufferedEventLock   sync.Mutex
+	maxBufferSize       int
+	maxBufferEntries    int
+	bufferTimeLimit     int
 	lastUploadTime      time.Time
 	uploadLock          sync.Mutex
 	cloudwatchState     *CloudwatchState
@@ -75,15 +89,30 @@ func (l *LogStream) addEventToBuffer(message []byte, timestamp int64) {
 	var uploadEvents bool
 
 	// TODO figure out better buffer size cutoff to correspond to AWS limit of 1,048,576 bytes
-	if l.bufferedEventsBytes >= 500000 {
+	if l.bufferedEventsBytes >= l.maxBufferSize {
 		uploadEvents = true
-		fmt.Println("Uploading events as 100KB buffer has been reached")
-	} else if time.Now().Sub(l.lastUploadTime).Seconds() >= 10 {
+		logrus.WithFields(logrus.Fields{
+			"log_stream_name":     l.LogStreamName,
+			"log_group_name":      l.LogGroupName,
+			"current_buffer_size": l.bufferedEventsBytes,
+			"max_buffer_size":     l.maxBufferSize,
+		}).Info("Uploading Cloudwatch Log Events as buffer size limit has been reached")
+	} else if time.Now().Sub(l.lastUploadTime).Seconds() >= float64(l.bufferTimeLimit) {
 		uploadEvents = true
-		fmt.Println("Uploading events as time limit has been reached")
-	} else if len(l.bufferedEvents) > 9000 {
+		logrus.WithFields(logrus.Fields{
+			"log_stream_name":           l.LogStreamName,
+			"log_group_name":            l.LogGroupName,
+			"seconds_since_last_upload": time.Now().Sub(l.lastUploadTime).Seconds(),
+			"buffer_time_limit":         l.bufferTimeLimit,
+		}).Info("Uploading Cloudwatch Log Events as time limit has been reached")
+	} else if len(l.bufferedEvents) > l.maxBufferEntries {
 		uploadEvents = true
-		fmt.Println("Uploading events as 9k event limit has been reached")
+		logrus.WithFields(logrus.Fields{
+			"log_stream_name":        l.LogStreamName,
+			"log_group_name":         l.LogGroupName,
+			"current_buffer_entries": len(l.bufferedEvents),
+			"max_buffer_entries":     l.maxBufferEntries,
+		}).Info("Uploading Cloudwatch Log Events as buffer entries limit has been reached")
 	}
 	l.bufferedEventLock.Unlock()
 
@@ -109,18 +138,40 @@ func (l *LogStream) UploadBufferedEvents() {
 		SequenceToken: l.LastSequenceToken,
 	})
 	if err != nil {
-		fmt.Println("error publishing log events")
-		fmt.Println(err.Error())
+		logrus.WithFields(logrus.Fields{
+			"log_group_name":  l.LogGroupName,
+			"log_stream_name": l.LogStreamName,
+			"error":           err,
+		}).Error("Error publishing Cloudwatch Log Events")
 		l.uploadLock.Unlock()
 		return
+	} else if resp.RejectedLogEventsInfo != nil {
+		fields := logrus.Fields{}
+		if resp.RejectedLogEventsInfo.ExpiredLogEventEndIndex != nil {
+			fields["expired_log_event_index"] = *resp.RejectedLogEventsInfo.ExpiredLogEventEndIndex
+		}
+		if resp.RejectedLogEventsInfo.TooNewLogEventStartIndex != nil {
+			fields["too_new_log_event_index"] = *resp.RejectedLogEventsInfo.TooNewLogEventStartIndex
+		}
+		if resp.RejectedLogEventsInfo.TooOldLogEventEndIndex != nil {
+			fields["too_old_log_event_index"] = *resp.RejectedLogEventsInfo.TooOldLogEventEndIndex
+		}
+		logrus.WithFields(fields).Error("Error publishing Cloudwatch Log Events")
 	}
 
 	l.LastSequenceToken = resp.NextSequenceToken
-	fmt.Println(resp.RejectedLogEventsInfo)
 	l.lastUploadTime = time.Now()
 	l.uploadLock.Unlock()
 }
 
 func (c *CloudwatchState) Store(flow *flowstore.Flow) {
 	c.LogStream.IngestEvent(flow)
+}
+
+func (c *CloudwatchState) Flush() {
+	c.LogStream.UploadBufferedEvents()
+}
+
+func (c *CloudwatchState) GetName() string {
+	return fmt.Sprintf("Cloudwatch %s", c.LogGroupName)
 }
